@@ -1,9 +1,14 @@
+use crate::bitcoin::Script;
 use crate::descriptor::Descriptor;
 use crate::Balance;
 use crate::{AddressIndex, AddressInfo, Network};
+use bdk::chain::SpkIterator as BdkSpkIterator;
+use bdk::descriptor::Descriptor as BdkDescriptor;
+use bdk::miniscript::DescriptorPublicKey;
 use bdk::wallet::Update as BdkUpdate;
-use bdk::Error as BdkError;
 use bdk::Wallet as BdkWallet;
+use bdk::{Error as BdkError, KeychainKind};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Debug)]
@@ -68,11 +73,53 @@ impl Wallet {
             .map_err(|e| BdkError::Generic(e.to_string()))
     }
 
+    pub fn spks_of_all_keychains(&self) -> HashMap<KeychainKind, Arc<SpkIterator>> {
+        let all_spks = self
+            .get_wallet()
+            .spk_index()
+            .spks_of_all_keychains()
+            .into_iter()
+            .fold(HashMap::new(), |mut map, (keychain, iter)| {
+                let spk_iter = SpkIterator(Mutex::new(
+                    iter as BdkSpkIterator<BdkDescriptor<DescriptorPublicKey>>,
+                ));
+                map.insert(keychain, Arc::new(spk_iter));
+                map
+            });
+        all_spks
+    }
+
     // pub fn commit(&self) -> Result<(), BdkError> {}
 
     // fn is_mine(&self, script: Arc<Script>) -> bool {
     //     self.get_wallet().is_mine(&script.inner)
     // }
+}
+
+#[derive(Debug)]
+pub struct IndexedScript {
+    pub index: u32,
+    pub script: Arc<Script>,
+}
+
+pub struct SpkIterator(pub(crate) Mutex<BdkSpkIterator<BdkDescriptor<DescriptorPublicKey>>>);
+
+impl SpkIterator {
+    pub fn new(descriptor: Arc<Descriptor>) -> SpkIterator {
+        Self(Mutex::new(BdkSpkIterator::new(
+            descriptor.extended_descriptor.clone(),
+        )))
+    }
+
+    pub fn next(&self) -> Option<IndexedScript> {
+        let mut bdk_spk_iterator = self.0.lock().unwrap();
+        bdk_spk_iterator
+            .next()
+            .map(|(index, script)| IndexedScript {
+                index,
+                script: Arc::new(script.into()),
+            })
+    }
 }
 
 pub struct Update(pub(crate) BdkUpdate);
@@ -639,7 +686,52 @@ pub struct Update(pub(crate) BdkUpdate);
 //             .map(Arc::new)
 //     }
 // }
-//
+
+#[cfg(test)]
+mod test {
+    use crate::descriptor::Descriptor;
+    use crate::wallet::Wallet;
+    use crate::Network;
+    use bdk::bitcoin::Address;
+    use bdk::{bitcoin, KeychainKind};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_spks_of_all_keychains() {
+        let descriptor = Descriptor::new(
+            "wpkh(tprv8ZgxMBicQKsPf2qfrEygW6fdYseJDDrVnDv26PH5BHdvSuG6ecCbHqLVof9yZcMoM31z9ur3tTYbSnr1WBqbGX97CbXcmp5H6qeMpyvx35B/84h/1h/0h/0/*)".to_string(),
+            Network::Testnet
+        ).unwrap();
+        let wallet = Wallet::new_no_persist(Arc::new(descriptor), None, Network::Testnet).unwrap();
+        let spks = wallet.spks_of_all_keychains();
+        spks.iter().for_each(|(keychain, spk_iter)| {
+            dbg!(keychain);
+            assert_eq!(*keychain, KeychainKind::External);
+            let mut spks_iter = spk_iter.0.lock().unwrap().clone();
+            let next_addr = spks_iter.next().map(|(i, s)| {
+                (
+                    i,
+                    Address::from_script(s.as_script(), bitcoin::Network::Testnet)
+                        .unwrap()
+                        .to_string(),
+                )
+            });
+            let expected_addr = "tb1qrnfslnrve9uncz9pzpvf83k3ukz22ljgees989".to_string();
+            assert!(matches!(next_addr, Some((i, addr)) if i == 0 && addr == expected_addr));
+            let next_addr = spks_iter.next().map(|(i, s)| {
+                (
+                    i,
+                    Address::from_script(s.as_script(), bitcoin::Network::Testnet)
+                        .unwrap()
+                        .to_string(),
+                )
+            });
+            let expected_addr = "tb1qltq3nuep2fghvnytukac5mq5hxhascs0v6hm3x".to_string();
+            assert!(matches!(next_addr, Some((i, addr)) if i == 1 && addr == expected_addr));
+        })
+    }
+}
+
 // // The goal of these tests to to ensure `bdk-ffi` intermediate code correctly calls `bdk` APIs.
 // // These tests should not be used to verify `bdk` behavior that is already tested in the `bdk`
 // // crate.
